@@ -68,12 +68,12 @@ then
        It uses this key material to construct a self-signed X.509v3 certificate.
 
   Usage:
-    `basename $0` -arn AWS_key_id \
-                  -CN "commonName" \
-                  -ST "stateOrProvince" \
-                  -O "Organisation" \
-                  -C "Country" \
-                  [ -email emailAddress ] \
+    `basename $0` -arn AWS_key_id \\
+                  -CN "commonName" \\
+                  -ST "stateOrProvince" \\
+                  -O "Organisation" \\
+                  -C "Country" \\
+                  [ -email emailAddress ] \\
                   [ -years years ]
 
   Where all three options are required,
