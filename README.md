@@ -46,11 +46,11 @@ is the Organisation used in the certifiate's subject and issuer field. e.g. `ACM
 is the Country name to be used in the certifiate's subject and issuer field. e.g. `GB`. It should be an ISO 3166-1 alpha-2 country code. It must be a string of two X.500 printableString characters.
 
 
-#### emailAddress
+#### emailAddress (optional)
 is the email address you want in the Issuer Alt Name field. e.g. `info@example.com`. It must be an RFC822 emailAddress. This is optional with no default.
 
 
-#### years
+#### years (optional)
 is the length of time the certificate will be valid for. Default 10. It can be any positive integer as long as "now + *years* years" works with the date command. The expiry date will be encoded as a UTCTIME string i.e. YYMMDDHHMMSSZ so choose wisely!
 
 
