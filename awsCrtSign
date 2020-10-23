@@ -1,0 +1,380 @@
+#!/bin/bash
+#
+# This program, awsCrtSign, retrieves key material from an AWS KMS RSA Signing Key.
+# It uses this key material to construct a self-signed X.509v3 certificate.
+#
+#    Copyright (C) 2020 Michael A S Jones <dr.mike.jones@gmail.com>
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+###############################################################################
+#
+# If this program has been useful, you can show your appreciation by 
+# buying me a coffee: https://www.buymeacoffee.com/EmceeArsey
+#
+###############################################################################
+#
+# This script creates a self-signed certificate based upon the variables below
+# It then, asks AWS for a public key using the AWS CLI tool and extracts 
+# the RSA exponent and modulus from that.
+#
+# Why is this useful? Some services like SalesForce use OAuth Bearer tokens to
+# authenticate to their API via a JSON Web Token (JWT) and require an X.509
+# certificate to configure their Web App's endpoint. I wanted to use AWS
+# Lambda to access one of these web applications while keeping my key material
+# safe. I therefore wanted to put all my key material into a secure key management
+# environment: AWS KMS. But I still needed the corresponding X.509 certificate.
+#
+# AWS KMS will sign things for you at $1/month for a key and 3 cents/10,000 API
+# calls/signatures (at time of writing). Yes, $12/year is a huge and difficult
+# to justify cost but a Serverless env in my case made this cost efficient.
+#
+# AWS lets you get the public key material of an asymmetric RSA Key via the AWS
+# KMS API but not an X509 certificate. You can get AWS to sign a Digest. An X.509
+# certificate however is essentially only these two things combined with some
+# metadata. That's where this program comes in.
+#
+# In order of appearance this script does.
+# 0 Setup and check
+# 1 Generate a unique serial number
+# 2 Obtain e and m the RSA public key material (Requires AWS cli tool)
+# 3 Make an asn1conf file
+# 4 Create asn1 file of tbscertificate (To be signed certificate)
+# 5 Sign the tbscertificate using remote private key and the SHA256 digest
+# 6 Build the end result X.509 certificate
+#
+
+###################
+# Some help
+#
+
+if [ "$1" = "-help" ]
+then
+  cat <<EOF
+
+  `basename $0`
+     - Retrieves key material from an Amazon KMS RSA Signing Key.
+       It uses this key material to construct a self-signed X.509v3 certificate.
+
+  Usage:
+    `basename $0` -arn AWS_key_id \
+                  -CN "commonName" \
+                  -ST "stateOrProvince" \
+                  -O "Organisation" \
+                  -C "Country" \
+                  [ -email emailAddress ] \
+                  [ -years years ]
+
+  Where all three options are required,
+
+    AWS_key_id is the full ARN of the AWS Key you wish to use e.g.
+        arn:aws:kms:eu-west-1:012345678901:key/12345678-9abc-def0-1234-56789abcdef0
+
+    commonName is the Common Name to be used in the certifiate's subject 
+      and issuer field. e.g. "Robot Certificate 1". It must be an X.500 printableString.
+
+    stateOrProvince is the stateOrProvince used in the certifiate's subject 
+      and issuer field. e.g. "Manchester". It must be an X.500 printableString.
+
+    Organisation is the Organisation used in the certifiate's subject 
+      and issuer field. e.g. "ACME Certificates Inc."
+      It must be an X.500 printableString.
+
+    Country is the Country name to be used in the certifiate's subject 
+      and issuer field. e.g. "GB". It should be an ISO 3166-1 alpha-2 country code.
+      It must be a string of two X.500 printableString characters.
+
+    emailAddress is the email address you want in the Issuer Alt Name field.
+      e.g. "info@example.com". It must be an RFC822 emailAddress.
+      This is optional with no default.
+
+    years is the length of time the certificate will be valid for. Default 10.
+      It can be any positive integer as long as "now + /years/ years" works 
+      with the date command. The expiry date will be encoded as a UTCTIME string
+      i.e. YYMMDDHHMMSSZ so choose wisely!
+
+  The certificate will be self-signed and have a Distinguished name similar to the following:
+  /C=GB/ST=Manchester/L=eu-west-1/O=Tekkatho Foundation/CN=Robot Certificate 2
+EOF
+  exit
+fi
+
+THISSCRIPT=`realpath -s $0`
+
+###########################
+# 0 Check local setup is OK
+#
+
+# What is the path to this script
+THISSCRIPT=`realpath -s $0`
+$THISSCRIPT -help |grep -q 'Retrieves key material from an Amazon KMS RSA Signing Key' || exit 1
+
+# Get command line arguments and check syntax
+YEARS=10
+while [ "$1" ]
+do
+  case $1 in
+    -arn)   shift;
+            KID=`echo "$1" |grep \
+'^arn:aws:kms:[a-z][a-z]-[a-z]\{4,9\}-[0-9]\{1,\}:[0-9]*:key/[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}$'`\
+            || exec "$THISSCRIPT" -help ;;
+    -email) shift;   EMAIL=`echo "$1" |grep '^.*@[a-zA-Z0-9_.-]*$'`             || exec "$THISSCRIPT" -help ;;
+    -C)     shift; COUNTRY=`echo "$1" |grep '^[A-Z][A-Z]$'`                     || exec "$THISSCRIPT" -help ;;
+    -ST)    shift;      ST=`echo "$1" |grep "^[[:alnum:]'()+,./:=? -]\{1,\}$"`  || exec "$THISSCRIPT" -help ;;
+    -CN)    shift;      CN=`echo "$1" |grep "^[[:alnum:]'()+,./:=? -]\{1,\}$"`  || exec "$THISSCRIPT" -help ;;
+    -O)     shift;     ORG=`echo "$1" |grep "^[[:alnum:]'()+,./:=? -]\{1,\}$"`  || exec "$THISSCRIPT" -help ;;
+    -years) shift;   YEARS=`echo "$1" |grep "^[1-9][0-9]*$"`                    || exec "$THISSCRIPT" -help ;;
+  esac
+  shift
+done
+
+# Extract useful info from ARN
+LOCATION=`echo "$KID" |sed -e 's/arn:aws:kms:\([^:]*\):.*/\1/'`
+ARNKID=`echo "$KID" |sed -e 's/.*\/\([0-9a-f-]*\)$/\1/'`
+
+# Check everything needed has been specified
+EXIT=0
+[ "$KID" = "" ]     && echo "Missing required options -arn" && EXIT=1
+[ "$COUNTRY" = "" ] && echo "Missing required options -C"   && EXIT=1
+[ "$ST" = "" ]      && echo "Missing required options -ST"  && EXIT=1
+[ "$CN" = "" ]      && echo "Missing required options -CN"  && EXIT=1
+[ $EXIT -eq 1 ]     && exec "$THISSCRIPT" -help
+
+# Create a temporary directory to run in
+TMP=`mktemp -p. -d` || exit 2
+cd "$TMP"
+[ "$(ls -A)" = "" ] || exit 3
+
+# Check non standard aws-cli is available
+echo -n "Checking aws client version:" >&2
+if aws --version | grep -q 'aws-cli/2\.'
+then echo " ... OK" >&2
+else cat<<EOF >&2
+ ... FAIL
+  This script require aws client tools version 2
+  See: https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html
+EOF
+  exit 1
+fi
+
+# Check we can use openssl
+echo -n "Checking OpenSSL tools" >&2
+if openssl version | grep -iq 'OpenSSL 1\.'
+then echo " ... OK" >&2
+else cat<<EOF >&2
+ ... FAIL
+  This script was written using openssl major version 1.
+    (version 3 might work but has not been tested against this script.)
+  See: https://www.openssl.org/source/
+EOF
+  exit 1
+fi
+
+# OK; Tell user we're good to go
+echo 
+echo "Attemting to Create Certificate for:"
+echo "  /C=$COUNTRY/ST=$ST/L=$LOCATION/O=$ORG/CN=$CN"
+[ "$EMAIL" ] && echo "issuerAltName: $EMAIL"
+echo "Validity: $YEARS years"
+echo
+
+###############################
+# 1 Pseudo unique serial number
+#
+
+SERIALNO=0x`openssl rand -hex 40|tr a-f A-F` || exit 2
+
+##########################################################
+# 2 Extract E and M from Public Key in AWS cert 
+
+# Get pubkey using aws-cli kms get-public-key
+aws kms get-public-key --key-id "$KID" --output text --query PublicKey | base64 --decode > public_aws_key.der || exit 3
+
+# Extract pubkey
+E=`openssl pkey -pubin -inform DER -in public_aws_key.der -text \
+   |grep Exponent |sed -e 's/Exponent: .*(\(0x[0-9a-f]*\)).*/\1/' |tr a-f A-F`
+M=`openssl rsa -pubin -inform DER -in public_aws_key.der -noout -modulus |grep '^Modulus=' |sed -e 's/^Modulus=/0x/'`
+echo "$E" |grep -q '^0x[0-9A-F]\{1,\}$' || exit 4
+echo "$M" |grep -q '^0x[0-9A-F]\{256,\}$' || exit 5
+
+####################
+# 3 Make Config File
+#
+
+# Need to calculate UTCTIMEs first
+notBefore=`date -u '+%y%m%d%H%M%SZ'`
+notAfter=`date -u -d "now + $YEARS years" '+%y%m%d%H%M%SZ'` || exit 6
+
+ISSUERALTNAME=""
+[ "$EMAIL" ] && ISSUERALTNAME='issuerAltName = SEQUENCE:issuerAltName'
+
+cat<<EOF > tbscertificate.asn1conf
+asn1=SEQUENCE:tbscertificate
+
+[signedcertificate]
+tbscertificate=SEQUENCE:tbscertificate
+alg=SEQUENCE:signature
+signature=FORMAT:HEX,BITSTRING:rsasha256signature
+#signature=SEQUENCE:signaturedata
+
+[tbscertificate]
+version=EXPLICIT:0C,INTEGER:0x02
+serialNo=INTEGER:$SERIALNO
+signature=SEQUENCE:signature
+issuer=SEQUENCE:issuer
+validity=SEQUENCE:validity
+subject=SEQUENCE:issuer
+SPKI=SEQUENCE:SPKI
+extensions=EXPLICIT:3C,SEQUENCE:v3ext
+
+[signature]
+algorithm=OID:sha256WithRSAEncryption
+parameter=NULL
+
+[issuer]
+c=SET:cseq
+st=SET:stseq
+l=SET:lseq
+o=SET:oseq
+cn=SET:cnseq
+
+[cseq]
+rdn=SEQUENCE:country
+
+[country]
+o=OID:countryName
+v=PRINTABLESTRING:$COUNTRY
+
+[stseq]
+rdn=SEQUENCE:stateorprovince
+
+[stateorprovince]
+o=OID:stateOrProvinceName
+v=PRINTABLESTRING:$ST
+
+[lseq]
+rdn=SEQUENCE:locality
+
+[locality]
+o=OID:localityName
+v=PRINTABLESTRING:$LOCATION
+
+[oseq]
+rdn=SEQUENCE:organisation
+
+[organisation]
+o=OID:organizationName
+v=PRINTABLESTRING:$ORG
+
+[cnseq]
+rdn=SEQUENCE:commonname
+
+[commonname]
+o=OID:commonName
+v=PRINTABLESTRING:$CN
+
+[validity]
+#YYMMDDHHMMSSZ
+b=UTCTIME:$notBefore
+a=UTCTIME:$notAfter
+
+[SPKI]
+algorithm=SEQUENCE:RSAEnc
+pubkey=BITWRAP,SEQUENCE:rsapubkey
+
+[RSAEnc]
+algorithm=OID:rsaEncryption
+parameter=NULL
+
+[rsapubkey]
+n=INTEGER:$M
+e=INTEGER:$E
+
+[v3ext]
+basicConstraints = SEQUENCE:basicConstraints
+keyUsage = SEQUENCE:keyUsage
+extendedKeyUsage = SEQUENCE:extendedKeyUsage 
+$ISSUERALTNAME
+
+[basicConstraints]
+o=OID:basicConstraints
+v=FORMAT:HEX,OCTETSTRING:3000
+
+[keyUsage]
+o=OID:keyUsage
+v=FORMAT:HEX,OCTETSTRING:030204B0
+
+[extendedKeyUsage]
+o=OID:extendedKeyUsage
+v=FORMAT:HEX,OCTETSTRING:301406082B0601050507030106082B06010505070302
+
+[issuerAltName]
+o=OID:issuerAltName
+v=OCTWRAP,SEQUENCE:ian
+
+[ian]
+i=FORMAT:ASCII,IMPLICIT:1C,OCTETSTRING:$EMAIL
+
+[signaturedata]
+alg=SEQUENCE:signature
+signature=FORMAT:HEX,BITSTRING:rsasha256signature
+EOF
+
+#########################
+# 4 create tbscertificate
+#
+
+openssl asn1parse -genconf tbscertificate.asn1conf -noout -out - > tbscertificate.der || exit 7
+
+###################################################
+# 5 Use private key to make certificate signature -- via a call to AWS
+#
+
+# Make Digest
+openssl sha256 -binary -out tbscertificate.sha256 tbscertificate.der || exit 8
+
+# Use aws-cli tool: kms sign
+aws kms sign --key-id "$KID" \
+             --message fileb://tbscertificate.sha256 \
+             --message-type DIGEST \
+             --signing-algorithm RSASSA_PKCS1_V1_5_SHA_256 \
+             --output text |awk '{print $2}' |base64 -d > signeddigest || exit 9
+SIGNATURE=`od -tx1 -An -v -w1 signeddigest |tr -d ' \n' |tr a-f A-F`
+echo $SIGNATURE |grep -q '^[0-9A-F]\{1,\}$' || exit 10
+
+###################################################
+# 6 Build the certificate
+#
+# Tweak config file to add signature data
+  sed -i "s/:rsasha256signature$/:$SIGNATURE/" tbscertificate.asn1conf
+  sed -i "s/^asn1=SEQUENCE:tbscertificate$/asn1=SEQUENCE:signedcertificate/" tbscertificate.asn1conf
+# Create Certificate (der)
+openssl asn1parse -genconf tbscertificate.asn1conf -noout -out - > signedcertificate.der || exit 11
+# Make a PEM
+openssl x509 -inform DER -in signedcertificate.der -out signedcertificate.crt || exit 12
+
+mv signedcertificate.crt "../$ARNKID.crt"
+rm public_aws_key.der
+rm signedcertificate.der
+rm tbscertificate.asn1conf
+rm tbscertificate.sha256
+rm signeddigest
+rm tbscertificate.der
+
+cd -
+rmdir "$TMP"
+
+echo "Certificate Location: $ARNKID.crt"
+
+openssl x509 -in "$ARNKID.crt" -text
